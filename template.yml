@@ -1,0 +1,186 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. 
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Following template example provides you with a setup for running AWS Systems Manager PortForwarding setup via an Amazon EC2 instance to Amazon ElastiCache.
+**WARNING** This template creates respective Amazon EC2 instance as well as Amazon ElastiCache with all related resources. You will be billed for the AWS resources used if you create a stack from this template.'
+
+Parameters:
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: 'Keeping the default value will select the latest available Amazon Linux 2 AMI.'
+  AvailabilityZones:
+    Description: >-
+      List of Availability Zones to use for the subnets in the VPC. Please select three availability zones.
+    Type: 'List<AWS::EC2::AvailabilityZone::Name>'
+  DefaultEgressCidr:
+    Type: 'String'
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Default: '0.0.0.0/0'
+    Description: 'Keep 0.0.0.0/0 unless you want to limit your default SecurityGroup Egress policy'
+
+Resources:
+  # # # # # # # # # # # # # #
+  # #   VPC Nested Stack  # #
+  # # # # # # # # # # # # # #
+  VPCStack:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: 'https://aws-quickstart.s3.amazonaws.com/quickstart-aws-vpc/templates/aws-vpc.template.yaml'
+      Parameters:
+        AvailabilityZones: !Join
+          - ','
+          - !Ref AvailabilityZones
+        NumberOfAZs: '3'
+  
+  # # # # # # # # # # # # # #
+  # #     ElastiCache     # #
+  # # # # # # # # # # # # # #
+  CacheSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Security group for cache cluster'
+      VpcId: !GetAtt VPCStack.Outputs.VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref BastionHostSecurityGroup
+          Description: 'Allow TCP traffic from the bastion host'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: !Ref DefaultEgressCidr
+          Description: 'Allow all outbound traffic by default'
+
+  CacheSubnets:
+    Type: 'AWS::ElastiCache::SubnetGroup'
+    Properties:
+      Description: Company Caching subnet group
+      SubnetIds:
+        - !GetAtt VPCStack.Outputs.PrivateSubnet1AID
+        - !GetAtt VPCStack.Outputs.PrivateSubnet2AID
+        - !GetAtt VPCStack.Outputs.PrivateSubnet3AID
+
+  ReplicationGroup:
+    Type: 'AWS::ElastiCache::ReplicationGroup'
+    Properties:
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      ReplicationGroupDescription: 'Cache infrastructure'
+      NumCacheClusters: 2
+      Engine: 'redis'
+      CacheNodeType: 'cache.t3.medium'
+      AutoMinorVersionUpgrade: true
+      AutomaticFailoverEnabled: false
+      CacheSubnetGroupName: !Ref CacheSubnets
+      EngineVersion: '5.0.6'
+      Tags:
+        - Key: Name
+          Value: Company-Caching
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroup
+
+  # # # # # # # # # # # # # #
+  # #   EC2 Bastion Host  # #
+  # # # # # # # # # # # # # #
+  BastionHostAccessRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+
+  BastionHostAccessInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: '/'
+      Roles:
+        - !Ref BastionHostAccessRole
+
+  BastionHostSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Security group for the bastion host for redis'
+      VpcId: !GetAtt VPCStack.Outputs.VPCID
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: !Ref DefaultEgressCidr
+          Description: 'Allow all outbound traffic by default'
+
+  BastionEc2Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          haproxy:
+            - haproxy_config
+            - haproxy_start
+        haproxy_config:
+          files:
+            /etc/haproxy/haproxy.cfg :
+              content: !Sub
+                - |
+                  global
+                      daemon
+                      maxconn 256
+
+                  defaults
+                      mode tcp
+                      timeout connect 5000ms
+                      timeout client 5000ms
+                      timeout server 5000ms
+
+                  listen redis
+                      bind *:6379
+                      server server1 ${RedisEndpoint} maxconn 32 check-ssl ssl verify none
+                -   { RedisEndpoint: !GetAtt ReplicationGroup.PrimaryEndPoint.Address }
+              mode: '0644'
+              owner: haproxy
+              group: haproxy
+        haproxy_start:
+          commands:
+            starthaproxy:
+              cwd: /tmp
+              command: 'systemctl enable haproxy; service haproxy restart; service rsyslog restart'
+    Properties:
+      IamInstanceProfile: !Ref BastionHostAccessInstanceProfile
+      InstanceType: t3.small
+      SubnetId: !GetAtt VPCStack.Outputs.PrivateSubnet2AID
+      SecurityGroupIds:
+        - !Ref BastionHostSecurityGroup
+      ImageId: !Ref LatestAmiId
+      Tags:
+        - Key: 'Name'
+          Value: 'bastionhost-redis'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y haproxy
+          yum install -y polkit
+          /usr/bin/aws configure set region ${AWS::Region}
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource BastionEc2Instance --configsets haproxy --region ${AWS::Region}
+
+          # Signal the status from cfn-init
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource BastionEc2Instance --region ${AWS::Region}
